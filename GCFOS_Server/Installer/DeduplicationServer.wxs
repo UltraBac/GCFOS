@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?define GCFOSServerDir="$(env.GCFOS_ROOT)\GCFOS_Server\"?>
+<?define GCFOSBinDir="$(env.GCFOS_ROOT)\GCFOS_Server\$(var.Configuration)"?>
+<?define MainBinDir="$(env.Dev)\bin\a64$(var.Configuration)"?>
+<?define MergeModules="c:\Program Files (x86)\Common Files\Merge Modules\"?>
+<?define Manufacturer="UltraBac Software"?>
+<?define ProductName="UltraBac Deduplication Server"?>
+<?define PackageLocation="$(env.Dev)\Packages"?>
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:netfx="http://schemas.microsoft.com/wix/NetFxExtension">
+  <Product Id="8F0B388A-571F-4DFF-9E02-63C15636D6A0" Name="$(var.ProductName)" Language="1033" Version="1.0.0.0" Manufacturer="$(var.Manufacturer)" UpgradeCode="A0D9CE94-54F1-4321-86B2-CD36FE79A7E0">
+    <Package InstallerVersion="405" Compressed="yes" InstallScope="perMachine"  Platform="x64"/>
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    
+    <!--The DISABLEADVTSHORTCUTS allows the adverise=yes below to not actually advertise, but install shortcuts correctly-->
+    <Property Id="DISABLEADVTSHORTCUTS" Value="1" />
+    <Property Id="ULTRABACINSTALLED">
+      <RegistrySearch Id="ULTRABACREGISTRYENTRY" Root="HKLM" Key="Software\UltraBac Software\UltraBac" Name="UbListenerPort" Win64="yes" Type="raw" />
+    </Property>
+    <Condition Message="The deduplication server cannot be installed on a machine that has UltraBac components. Please uninstall UltraBac software first">
+      <![CDATA[Installed OR NOT ULTRABACINSTALLED]]>
+    </Condition>
+    <Media Id="1" EmbedCab="yes" Cabinet="DeduplicationServer.cab" />
+    <Feature Id="ProductFeature" Title="Deduplication Server" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="GCFOSdb"/>
+      <ComponentRef Id="MyApplicationShortcut"/>
+    </Feature>
+
+    <Feature Id="VCRedist" Title="Visual C++ 11.0 Runtime" AllowAdvertise="no" Display="hidden" Level="1">
+      <MergeRef Id="VCRedist"/>
+    </Feature>
+
+    <PropertyRef Id="NETFRAMEWORK45"/>
+    <Condition Message="This application requires .NET Framework 4.5. Please install the .NET Framework then run this installer again.">
+      <![CDATA[Installed OR NETFRAMEWORK45]]>
+    </Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir" >
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ManufacturerFolder" Name="$(var.Manufacturer)" >
+          <Directory Id ="MyProductFolder" Name="$(var.ProductName)" >
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramFiles64Folder" >
+        <Directory Id="MANUFACTURERFOLDER" Name="$(var.Manufacturer)" >
+          <Directory Id="INSTALLFOLDER" Name="Deduplication Server">
+            <Merge Id="VCRedist" SourceFile="$(var.MergeModules)Microsoft_VC110_CRT_x64.msm" DiskId="1" Language="0"/>
+            <Directory Id="gcfosdb" Name="gcfosdb">
+              <Component Id="GCFOSdb" Guid="31636C41-AB39-40C7-8D67-8B2951735C1E" SharedDllRefCount="no" KeyPath="no" NeverOverwrite="no" Permanent="no" Transitive="no" Location="either">
+                <CreateFolder/>
+              </Component>
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="ProgramMenuFolder" >
+      <Component Id="MyApplicationShortcut" Guid="8AA0C45B-D922-4809-A604-FB9A16D2F736" Win64="yes">
+        <RegistryValue Root="HKCU" Key="SOFTWARE\$(var.Manufacturer)\$(var.ProductName)" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Icon Id="ConfigureDeduplicationServerIcon.ico" SourceFile="$(var.GCFOSServerDir)ConfigureDeduplicationServer\1381_cog.ico"/>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id='GCFOS_Server_Programs' Guid='84541049-0ACA-485E-97CD-240827ADB88D' Win64='yes'>
+        <File Id="GCFOS_Server.exe" Name="GCFOS_Server.exe" DiskId='1' Source="$(var.GCFOSBinDir)\GCFOS_Server.exe" ProcessorArchitecture='x64'/>
+        <!--MAKE SURE that GCFOS_Server.exe is the FIRST file as this is what is used for ther service install, regardless of where the ServiceInstall entries are placed-->
+        <ServiceInstall Id='GCFOS_Service' Type='ownProcess' Name='$(var.ProductName)' DisplayName='$(var.ProductName)' Description='$(var.Manufacturer) Deduplication Service' Start='auto' Vital='yes' ErrorControl='normal' />
+        <ServiceControl Id='Start_GCFOS' Stop='uninstall' Remove='uninstall' Name='$(var.ProductName)' />
+        <File Id="AWSSDK.Core.dll" Name="AWSSDK.Core.dll" DiskId='1' Source="$(var.PackageLocation)\AWS\v3\net45\AWSSDK.Core.dll" ProcessorArchitecture='x64'/>
+        <File Id="AWSSDK.S3.dll" Name="AWSSDK.S3.dll" DiskId='1' Source="$(var.PackageLocation)\AWS\v3\net45\AWSSDK.S3.dll" ProcessorArchitecture='x64'/>
+        <File Id="Newtonsoft.Json.dll" Name="Newtonsoft.Json.dll" DiskId='1' Source="$(var.PackageLocation)\Newtonsoft.Json.dll" ProcessorArchitecture='x64'/>
+        <File Id="openstacknet.dll" Name="openstacknet.dll" DiskId='1' Source="$(var.PackageLocation)\openstacknet.dll" ProcessorArchitecture='x64'/>
+        <File Id="SimpleRESTServices.dll" Name="SimpleRESTServices.dll" DiskId='1' Source="$(var.PackageLocation)\SimpleRESTServices.dll" ProcessorArchitecture='x64'/>
+        <File Id="Microsoft.WindowsAzure.Storage.dll" Name="Microsoft.WindowsAzure.Storage.dll" DiskId="1" Source="$(var.PackageLocation)\Microsoft.WindowsAzure.Storage.dll" ProcessorArchitecture="x64" />
+        <RemoveFolder Id="RemoveManufacturerFolder" Directory="ManufacturerFolder" On="uninstall"/>
+        <RemoveFolder Id="RemoveProductFolder" Directory="MyProductFolder" On="uninstall"/>
+      </Component>
+      <Component Id="GCFOS_UI_Programs" Guid="BF711E0B-A9CF-4FD4-B1BD-F63F771F2E02" Win64="yes">
+        <File Id="ConfigureDeduplicationServer.exe" Name="ConfigureDeduplicationServer.exe" DiskId="1" Source="$(var.MainBinDir)\ConfigureDeduplicationServer.exe" ProcessorArchitecture="x64" >
+          <Shortcut Id="ConfigureDeduplicationServerShortcut" Name="Configure $(var.ProductName)" Directory="MyProductFolder" Description="Configure $(var.ProductName)" WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="ConfigureDeduplicationServerIcon.ico"/>
+        </File>
+        <File Id="ConfigureDeduplicationServer.exe.config" Name="ConfigureDeduplicationServer.exe.config" DiskId="1" Source="$(var.MainBinDir)\ConfigureDeduplicationServer.exe.config" ProcessorArchitecture="x64" />
+      </Component>
+    </ComponentGroup>
+
+    <WixVariable Id='WixUILicenseRtf' Value='licenseagreement.rtf'/>
+    <UIRef Id="WixUI_InstallDir" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+  </Product>
+
+</Wix>
