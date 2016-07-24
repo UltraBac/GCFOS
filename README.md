@@ -21,8 +21,8 @@ x64 Windows Platform (tested on Windows Server 2008 and 2012). The
 client can be compiled for x86 and x64 Windows and Linux platforms
 (tested on most Windows clients and RedHat 6). There is also a .Net
 client for C\# and other .Net languages. The clients are designed to
-have minimal dependencies on 3^rd^ party libraries, and can be built
-very lightweight for limited-resource applications.
+have minimal dependencies on 3rd-party libraries, and can be built very
+lightweight for limited-resource applications.
 
 **Dependencies:**
 
@@ -422,8 +422,8 @@ blocks added will need to be stored.
 
 The server tracks the “current” sequence\#/offset as it’s writing
 sequentially to the current blocks file. The naming convention is
-xxxxxx/yyyy so the relative path for the 1,234,567^th^ file sequence
-will be stored in the relative path 000123/4567. Once that file reaches
+xxxxxx/yyyy so the relative path for the 1,234,567th file sequence will
+be stored in the relative path 000123/4567. Once that file reaches
 around 256MB it will be closed and the next sequence will be opened,
 000123/4568. This naming convention ensures that a single sub-directory
 contains no more than 10,000 files and so efficiently uses NTFS (or
