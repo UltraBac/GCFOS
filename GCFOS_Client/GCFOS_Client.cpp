@@ -26,7 +26,8 @@ sales@ultrabac.com
 
 #include "stdafx.h"
 
-// This is an example of an exported variable
+// This is an example of an exported variable (using GCFOS_CLIENT_API)
+// We have to define the storage for the linker to use for these statics
 GCFOS_CLIENT_API int nGCFOS_Client_Ver=1;
 
 GCFOS_PRIVATE_STATICS *GCFOS_Client::m_statics = NULL;
@@ -42,15 +43,20 @@ GCFOS_Client::GCFOS_Client()
 #endif//_WIN32
 
 	m_priv = new GCFOS_PRIVATE_MEMBERS();
-	m_priv->m_bInit = false;
-	m_priv->m_bConnected = false;
-	m_priv->m_uLZOsize = 0;
+	m_priv->m_bInit = false; // indicates that the compression library has not yet be initialized 
+	m_priv->m_bConnected = false; // indicate that the connection has not yet been established to a server
+	m_priv->m_uLZOsize = 0; 
 
 	if(m_statics == NULL)
 		{
+		// These statics are shared by ALL modules sharing this one instance of the library
+		// (i.e. all threads will share this one variable)
+		// This is used because the database connections are all shared and use their own
+		// serialization mechanism
 		m_statics = new GCFOS_PRIVATE_STATICS;
 		}
 	m_CachePath = new TCHAR[3];
+	// the defaul is to put the database (cache) files in the same directory as "current"
 #ifdef _WIN32
 	_tcscpy_s(m_CachePath, 3, _T(".\\"));
 	if(WSAStartup(MAKEWORD(2,2), &wsaData) != 0)
@@ -64,6 +70,7 @@ GCFOS_Client::GCFOS_Client()
 
 GCFOS_Client::~GCFOS_Client()
 	{
+	// destructor -- free any memory held by the class and terminate winsock
 	delete m_CachePath;
 	delete m_priv;
 #ifdef _WIN32
@@ -72,10 +79,44 @@ GCFOS_Client::~GCFOS_Client()
 
 	}
 
+// GetClientID
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Allows caller to get the client ID# of the current session (or 0 if not connected)
+// 
+// Prerequisites / assumptions:
+//		None
+//
+// Returns:
+//		(GCFOS_CLIENTID) the client # of the session if connected
+
 GCFOS_CLIENTID GCFOS_Client::GetClientID()
 	{
 	return m_priv->m_ClientID;
 	}
+
+// AttemptAutoConfig
+//
+// Parameters:
+//		hKey - Current open registry handle to configuration key used for client
+//
+// Description:
+//		Called by Connect() if it determines that no configuration is present.
+//		The routine uses the UltraBac IANA-assigned UDP port 1910 to broadcast a request to locate a GCFOS server on the local network
+//		If a server is listening, it will reply with the configuration information that it needs to configure itself, which will
+//		be defined in a GCFOS_CONFIG_RESPONSE or GCFOS_CONFIG_RESPONSE_2. The size of the structure determines which type of
+//		response it has received (and hence, the two must not be of the same size). The type of response that the server sends
+//		is determined by whether the server is running in global(redirection) or local mode.
+//		Note: A server would need to be present on every desired subnet in order to be able to respond to clients throughout the network.
+// 
+// Prerequisites / assumptions:
+//		hKey is a valid registry key that is open for read/write access
+//
+// Returns:
+//		(bool) indicating success or failure of whether the function was able to configure correctly
 
 bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 	{
@@ -119,6 +160,8 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 		return false;
 		}
 
+	// prepare to BROADCAST a service discovery request 
+
 	memset((char *) &broadcastaddr, 0, sizeof(broadcastaddr));
     broadcastaddr.sin_family = AF_INET;
     broadcastaddr.sin_port = htons((u_short)atoi(GCFOS_SERVER_PORT));
@@ -130,11 +173,13 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 		{
 		FD_ZERO(&FDS);
 		FD_SET(udp_s, &FDS);
+		// now perform the UDP broadcast
 		if(SOCKET_ERROR == sendto(udp_s, (LPCSTR)&request, sizeof(request), 0, (const sockaddr *)&broadcastaddr, sizeof(broadcastaddr)))
 			{
 			DEBUGLOG(("AttemptAutoConfig: sendto failed, %u\n", WSAGetLastError()));
 			break;
 			}
+		// wait for two seconds for a response to the broadcast
 		switch(select((int)udp_s + 1, &FDS, NULL, NULL, &sockettimeout))
 			{
 			case SOCKET_ERROR:
@@ -142,7 +187,7 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 				retry = 99;
 				break;
 			case 0:
-				break; // timeout
+				break; // timeout -- packet not received in time
 			case 1:
 				if(SOCKET_ERROR == recv(udp_s, (LPSTR)response, sizeof(response2), 0))
 					{
@@ -150,8 +195,14 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 					retry = 99;
 					break;
 					}
+				// we have received a response to our broadcast
+				// inspect the size field (the first field) and see if it matches the size of one of the
+				// two different types of packet that we support
 				switch(response2.Size)
 					{
+					// this is the type of response we expect for "simple" or local server configurations
+					// all that we get in this type of response is the IP / servername of the GCFOS server
+					// that has responded. We store this in the registry, and will then return successfully
 					case sizeof(GCFOS_CONFIG_RESPONSE):
 						dwLen = (DWORD)(_wcslen(response->wszComputerName) + 1) * sizeof(WCHAR);
 						status = RegSetValueExW(hKey, GCFOS_CLIENT_REG_SERVER, NULL, REG_SZ, (LPBYTE)&response->wszComputerName, dwLen);
@@ -168,6 +219,9 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 						retval = true;
 						break;
 
+					// this is the type of response when a server is configured in "redirection mode" which 
+					// will give us the client id#, the secret key and the IP address of the server, which
+					// we store in the registry and will return success to the caller
 					case sizeof(GCFOS_CONFIG_RESPONSE_2):
 						dwLen = (DWORD)(_wcslen(response2.wszServerIP) + 1) * sizeof(WCHAR);
 						status = RegSetValueExW(hKey, GCFOS_CLIENT_REG_SERVER, NULL, REG_SZ, (LPBYTE)&response2.wszServerIP, dwLen);
@@ -199,6 +253,8 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 						retval = true;
 						break;
 
+					// we don't recognize the size of the packet being sent -- perhaps it got corrupted
+					// regardless, we'll abort auto-config and tell the caller we failed
 					default:
 						DEBUGLOG(("AttemptAutoConfig: invalid response size received, %d\n", response->Size));
 						retry = 99;
@@ -207,9 +263,27 @@ bool GCFOS_Client::AttemptAutoConfig(HKEY hKey)
 				break;
 			}
 		}
+	// discard our UDP socket and return to the caller
 	closesocket(udp_s);
 	return retval;
 	}
+
+// CreateRegistryKeyWithEveryoneAccess
+//
+// Parameters:
+//		pszKeyPath - the name of the registry to create
+//
+// Description:
+//		Creates the SecurityDescriptor, the ACL, the DACL and all the other bits necessary to create
+//		the security attributes on a newly created registry key that allows everyone access
+//		This is necessary because otherwise client programs may fail later to get access to the
+//		configuration information stored in the registry
+// 
+// Prerequisites / assumptions:
+//		pszKeyPath is a valid registry path name
+//
+// Returns:
+//		(HKEY) the registry handle of the key just created, or NULL in event of failure
 
 #ifdef _WIN32
 HKEY CreateRegistryKeyWithEveryoneAccess(LPCTSTR pszKeyPath)
@@ -323,6 +397,34 @@ bool GCFOS_Client::Connect(LPCTSTR cachePath, LPCTSTR CompanyName, bool EnableLo
 	{
 	return Connect(cachePath, CompanyName, EnableLocalBlockCache, EnableExtendedBlockCache, NULL, 0, NULL);
 	}
+
+// Connect
+//
+// Parameters:
+//		cachePath - a disk path location where the cache files will be stored (the database files)
+//		CompanyName - the name of the Company that is using this software (used to determine the registry location used)
+//		EnableLocalBlockCache - the cache database will contain a cache of all the block hashes present on the server
+//		EnableExtendedBlockCache - the cache database will additionally have a filename(hash)->blockchain lookup.
+//		Server - the name of the server (either IP address string or DNS-resolvable server name) to connect to
+//		Client - the client ID# to use (may be 0 for a local-mode server)
+//		Secret - the 32-byte shared secret for this client to use (may be NULL for connecting to a local-mode server)
+//
+// Description:
+//		If ClientID is 0, or the secret is not passed in, the routine will use the values from the registry. These
+//		registry values are written by the AttemptAutoConfig function above.
+//		The routine will attempt to establish a connection to the server using a TCP socket to port 1910 of the server.
+//		If a connection is established but no client-ID/secret is available the routine will attempt to perform
+//		a simple-auth which will only suceeed on a local-mode server connection.
+//		In the case of a global-mode server connection, this routine will exit successfully, but no authentication
+//		will have been performed. The caller of the client routine is expected to then call Auth().
+// 
+// Prerequisites / assumptions:
+//
+// Returns:
+//		(bool) indicates success of connection attempt
+//
+// NOTE:
+//		You should modify "<default IP address>" (below) to the IP address or FQDN of the default GCFOS server you wish to use
 
 bool GCFOS_Client::Connect(LPCTSTR cachePath, LPCTSTR CompanyName, bool EnableLocalBlockCache, bool EnableExtendedBlockCache, LPCTSTR Server, GCFOS_CLIENTID Client, BYTE const * Secret)
 	{
@@ -557,6 +659,10 @@ bool GCFOS_Client::Connect(LPCTSTR cachePath, LPCTSTR CompanyName, bool EnableLo
 		m_priv->m_bUBDR = true;
 		}
 #endif//_WIN32
+
+	// If a clientID/secret has not been defined, let's try to do a simple-authentication where we tell the
+	// server our computer-name and the server will tell us our client-ID# and establish an authenticated
+	// session. (This will fail if the server is a "global mode" server).
 	if(!m_priv->m_bSecretFound)
 		{
 		GCFOS_REQUEST_SIMPLE_AUTH	simpleauth;
@@ -593,10 +699,42 @@ bool GCFOS_Client::Connect(LPCTSTR cachePath, LPCTSTR CompanyName, bool EnableLo
 	return true;
 	}
 
+// SwitchClient
+//
+// Parameters:
+//		pszNewComputerName -- the computer name of the computer being processed next
+//
+// Description:
+//		This routine is helpful for client software that might run connected to a local-mode server and backup
+//		data from many computers. Since the client ID# is different for each computer, we must dynamically
+//		change our client ID# for each comptuer we process. In this case, the caller must notify us by
+//		calling this routine every time the computer name changes. This is necessary so that the server
+//		knows that the same file is coming from different computers and therefore recognize the files
+//		that are common amongst them.
+// 
+// Prerequisites / assumptions:
+//		A valid, simple-authenticated session to the server has already been established
+//
+// Returns:
+//		(bool) indicates success / failure of routine
+//
+
 bool GCFOS_Client::SwitchClient(LPCWSTR pszNewComputerName)
 	{
 	GCFOS_REQUEST_SIMPLE_AUTH	simpleauth;
 	GCFOS_SIMPLE_AUTH_RESPONSE	simpleauth_resp;
+
+	if(m_priv->m_bConnected == false)
+		{
+		// not connected, error
+		return false;
+		}
+
+	if(!m_bSimpleAuthSuccessful)
+		{
+		// nothing to do -- we are connected to a global-mode server
+		return true;
+		}
 
 	memset(&simpleauth, 0, sizeof(simpleauth));
 	_wcsncpy(simpleauth.szName, pszNewComputerName, GCFOS_COMPUTER_NAME_LENGTH);
@@ -626,6 +764,30 @@ bool GCFOS_Client::SwitchClient(LPCWSTR pszNewComputerName)
 	return true;
 	}
 
+// Query
+//
+// Parameters:
+//		q - the 20 byte hash (in binary) of the file being queried
+//		size - the filesize of the file being queried
+//
+// Description:
+//		The caller has already calculated the hash and obtained the filesize for a file in question, and would like
+//		to know whether the file is common or not on the server.
+//		The caller should first call GetHash() or GetHashForHandle() to calculate the hash of the file
+// 
+// Prerequisites / assumptions:
+//		An authenticated session to the server has already been established
+//
+// Returns:
+//		(GCFOS_SRV_RESPONSE) indicates result of query
+//		Values : Meaning
+//		GCFOS_SRV_RESP_NOT_CONNECTED  : No session established -- call Connect() / Auth() prior to calling this routing
+//		GCFOS_SRV_RESP_CLIENT_ERROR   : Fatal error occurred
+//		GCFOS_SRV_RESP_NOT_CONFIGURED : This server does not have a file-store configured for use
+//		GCFOS_SRV_RESP_RESIDENT       : This file is resident on the server (the caller need only store the metadata (inc. filesize) and the hash)
+//		GCFOS_SRV_RESP_UNIQUE         : This file is unique to this client and should be backed up in a normal fashion
+//		GCFOS_SRV_RESP_WANTED         : This file is wanted to become resident -- caller is expected to call ContributeFile() to upload to server
+
 GCFOS_SRV_RESPONSE GCFOS_Client::Query(BYTE const * q, UINT32 size)
 	{
 	GCFOS_REQUEST_QUERY			req;
@@ -650,6 +812,8 @@ GCFOS_SRV_RESPONSE GCFOS_Client::Query(BYTE const * q, UINT32 size)
 
 	if(m_bEnableLocalCache)
 		{
+		// a local cache database is available -- check to see if we already know if the file
+		// is resident, or unique.
 		memcpy(&residentEntry.SHA1, q, GCFOS_SHA1_LEN);
 		residentEntry.size = req.size;
 		if(m_statics->m_db_resident.find(&residentEntry) == 0)
@@ -667,6 +831,7 @@ GCFOS_SRV_RESPONSE GCFOS_Client::Query(BYTE const * q, UINT32 size)
 			}
 		}
 	
+	// we have to query the server directly to find out the status of this file
 	EnterCriticalSection(&m_priv->m_csAccess);
 	QueryPerformanceCounter(&start_time);
 	m_priv->m_Queries++;
@@ -719,6 +884,17 @@ GCFOS_SRV_RESPONSE GCFOS_Client::Query(BYTE const * q, UINT32 size)
 	return result.Response;
 	}
 
+// Close
+//
+// Description:
+//		Used to terminate a session open to a server
+//		Calls UpdateLocalBlockCache() -- shares a small number of block cache entries to refresh the server
+//		Releases all resources/memory held by the session
+//		Closes the database (local cache) -- this may take several seconds if there have been many updates to the cache in this session (flushes-to-disk)
+// 
+// Prerequisites / assumptions:
+//		Session is currently open
+
 void GCFOS_Client::Close()
 	{
 	UINT16 i;
@@ -743,6 +919,29 @@ void GCFOS_Client::Close()
 	gcfosdb::CloseEnvironment();
 	return;
 	}
+
+// Auth
+//
+// Parameters:
+//		NONE
+//
+// Description:
+//		Ensures that the LCUD (local client unique database) is up-to-date with the server
+//		Obtains configuration/version information about the remote server
+//		If the server is running in global-mode then a challenge-response mechanism is used to authenticate this client
+//			The client requests an authentication with the server
+//			The server generates some random data and sends that data to the client
+//			The client then encrypts it with the shared-key using AES, then sends that encrypted data back to server
+//			The server then compares that data received to the version of the data that it encrypted itself using the same key
+//			If the encrypted keys match, then the server sends a response to the client acknowledging the successful authentication
+//			Otherwise the server bans the IP address of the sender and immediately terminates the connection			
+//		Opens the local cache databases
+//		Checks the client/server validation values, and if a mismatch is detected the local cache database is recreated as it is invalidated
+// 
+// Prerequisites / assumptions:
+//		Connect() has been successfully called
+//
+// Returns:
 
 GCFOS_SRV_RESPONSE GCFOS_Client::Auth()
 	{
@@ -955,6 +1154,20 @@ GCFOS_SRV_RESPONSE GCFOS_Client::Auth()
 	return response_2.result;
 	}
 
+// InitializeCompression
+//
+// Parameters:
+//		NONE
+//
+// Description:
+//		Allocates and initializes the memory used by the IPP compression routines
+// 
+// Prerequisites / assumptions:
+//		NONE
+//
+// Returns:
+//		(bool) indicates success / fail of routine
+
 bool GCFOS_PRIVATE_MEMBERS::InitializeCompression()
 	{
 	// Initialize compression
@@ -982,6 +1195,28 @@ bool GCFOS_PRIVATE_MEMBERS::InitializeCompression()
 
 	return true;
 	}
+
+// RetrieveWholeFile
+// (Overloaded -- this version is for writing to an open HANDLE)
+//
+// Parameters:
+//		hFile - Handle of file to write to (file being retrieved)
+//		SHA1 - hash of the file being retrieved
+//		size - the filesize of the file being retrieved
+//		ValidationKey - a 4-byte value provided by Query() that ensures this client has access to this file
+//			-- Must be provided, but the value is not checked if the server is running in "local mode"
+//
+// Description:
+//		Retrieves the whole file data and writes the data from beginning of file into the given handle sequentially.
+//		Existing file contents are overwritten.
+// 
+// Prerequisites / assumptions:
+//		An authenticated session to the server has already been established
+//		Handle must have write access
+//		Server must have an active file-store configured
+//
+// Returns:
+//		(bool) indicates success or failure of retrieval
 
 bool GCFOS_Client::RetrieveWholeFile(FILEHANDLE hFile, BYTE const * SHA1, UINT32 size, LPBYTE ValidationKey)
 	{
@@ -1202,6 +1437,31 @@ RetrieveWholeFile_cleanup:
 	return rtn;
 	}
 
+// RetrieveFilePortion
+//
+// Parameters:
+//		SHA1 - hash of the file being retrieved
+//		size - the filesize of the file being retrieved
+//		ValidationKey - a 4-byte value provided by Query() that ensures this client has access to this file
+//			-- Must be provided, but the value is not checked if the server is running in "local mode"
+//		offset - the offset in the file to read
+//		buffer - the buffer to write the filedata retrieved
+//		buffsize - the size of buffer
+//
+// Description:
+//		Retrieves a part of a file into the buffer
+//		This routine performs some rudimentary caching when the block-store is being used by caching between calls
+//		the contents of the hashchain for the file. If successive calls request different parts of the SAME file
+//		then the blockchain does not need to be retrieved each time and will improve performance
+// 
+// Prerequisites / assumptions:
+//		An authenticated session to the server has already been established
+//		Server must have an active file-store configured
+//
+// Returns:
+//		(bool) indicates success or failure of retrieval
+//		Attempting to read past virtual EOF will result in ERROR (false) being returned
+
 bool GCFOS_Client::RetrieveFilePortion(BYTE const * SHA1, UINT32 size, LPBYTE ValidationKey, UINT32 offset, LPBYTE buffer, UINT32 buffersize)
 	{
 	// Retrieve a portion of a file from the server (nothing is written, just a buffer is returned)
@@ -1369,6 +1629,29 @@ bool GCFOS_Client::RetrieveFilePortion(BYTE const * SHA1, UINT32 size, LPBYTE Va
 	return true;
 	}
 
+// RetrieveWholeFile
+// (Overloaded -- this version is for writing to a FILENAME)
+//
+// Parameters:
+//		SHA1 - hash of the file being retrieved
+//		size - the filesize of the file being retrieved
+//		filename - the filename to write the data to
+//		ValidationKey - a 4-byte value provided by Query() that ensures this client has access to this file
+//			-- Must be provided, but the value is not checked if the server is running in "local mode"
+//
+// Description:
+//		Retrieves the whole file data and writes the data from beginning of file into the given filename sequentially.
+//		Existing file contents are overwritten.
+// 
+// Prerequisites / assumptions:
+//		An authenticated session to the server has already been established
+//		Caller must have write access to filename
+//		filename MUST NOT EXIST (no overwrite allowed -- caller should delete file prior to call)
+//		Server must have an active file-store configured
+//
+// Returns:
+//		(bool) indicates success or failure of retrieval
+
 bool GCFOS_Client::RetrieveWholeFile(BYTE const * SHA1, UINT32 size, LPCTSTR filename, LPBYTE ValidationKey)
 	{
 	FILEHANDLE		hFile = INVALID_HANDLE_VALUE;
@@ -1395,6 +1678,22 @@ bool GCFOS_Client::RetrieveWholeFile(BYTE const * SHA1, UINT32 size, LPCTSTR fil
 	CloseHandle(hFile);
 	return rtnval;
 	}
+
+// RegisterNewClient
+//
+// Parameters:
+//		*newid[out] - The new client ID# created
+//		*sharedkey[out] - The new shared key for the client
+//
+// Description:
+//		Only used when the server is configured for global mode
+//		GCFOS_Tools.exe uses this routine to define new clients
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated as the admin (client #1)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
 
 GCFOS_SRV_RESPONSE GCFOS_Client::RegisterNewClient(PUINT32 newid, LPBYTE sharedkey)
 	{
@@ -1429,6 +1728,22 @@ GCFOS_SRV_RESPONSE GCFOS_Client::RegisterNewClient(PUINT32 newid, LPBYTE sharedk
 
 	return GCFOS_SRV_RESP_OK;
 	}
+
+// GetClientDetails
+//
+// Parameters:
+//		id - The client ID# to query
+//		*sharedkey[out] - The shared key for the client
+//
+// Description:
+//		Only used when the server is configured for global mode
+//		GCFOS_Tools.exe uses this routine to display a given client's shared key
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated as the admin (client #1)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
 
 GCFOS_SRV_RESPONSE GCFOS_Client::GetClientDetails(UINT32 id, PUCHAR sharedkey)
 	{
@@ -1465,6 +1780,21 @@ GCFOS_SRV_RESPONSE GCFOS_Client::GetClientDetails(UINT32 id, PUCHAR sharedkey)
 	return GCFOS_SRV_RESP_OK;
 	}
 
+// RegisterNewClient
+//
+// Parameters:
+//		id - The client ID# to delete
+//
+// Description:
+//		Only used when the server is configured for global mode
+//		GCFOS_Tools.exe uses this routine to delete existing clients
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated as the admin (client #1)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
+
 GCFOS_SRV_RESPONSE GCFOS_Client::DeleteClient(UINT32 id)
 	{
 	GCFOS_REQUEST_DELETE_CLIENT		req;
@@ -1496,6 +1826,29 @@ GCFOS_SRV_RESPONSE GCFOS_Client::DeleteClient(UINT32 id)
 	return result;
 	}
 
+// ContributeFile
+// (Overloaded -- this version is for contributing by FILENAME)
+//
+// Parameters:
+//		filename - location of file to contribute
+//		SHA1 - hash of file
+//		size - file size
+//		flags - optional flags (allows FORCE donation if admin)
+//
+// Description:
+//		If the caller calls Query() on a file and the response is GCFOS_SRV_RESP_WANTED, then the caller's obligation
+//		is to call ContributeFile on the given file. This could be done in another thread (with it's own instance of
+//		GCFOS_Client() so that the primary thread can continue its operations).
+//		Once this routine completes successfully, future Query() operations will then indicate GCFOS_SRV_RESP_RESIDENT so that
+//		the file data can be omitted from future backups.
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated
+//		Caller must have read/write access to file (write access might not be necessary, but it is requested
+//		perhaps because it is required by BackupRead routine)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
 
 bool GCFOS_Client::ContributeFile(LPCTSTR filename, BYTE const * SHA1, UINT32 size, UCHAR flags /* = 0*/)
 	{
@@ -1523,10 +1876,31 @@ bool GCFOS_Client::ContributeFile(LPCTSTR filename, BYTE const * SHA1, UINT32 si
 	return result;
 	}
 
-// This internal function sends all the individual blocks that comprise a common file and sends them
-// to the server for storage, then sends the list of all the hashes that comprise the file
-// There may be a "remainder" block to affix to the hash chain if the last block is smaller than
-// GCFOS_MINIMUM_BLOCK_SIZE
+// GenerateBlockHashChain
+//
+// Parameters:
+//		pReqContributeFile - details of the contribution request
+//		hFile - Open handle of file for contribution
+//		SHA1 - hash of file
+//		size - file size
+//		filename - local source filename, for diagnostic/tracking purposes
+//
+// Description:
+//		This routine is called in the event that a contribution is made where the server has been
+//		configured for both a file-store and block-store.
+//		This INTERNAL function sends all the individual blocks that comprise a common file and sends them
+//		to the server for storage, then sends the list of all the hashes that comprise the file
+//		There may be a "remainder" block to affix to the hash chain if the last block is smaller than
+//		GCFOS_MINIMUM_BLOCK_SIZE
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated
+//		Caller must have read/write access to file (write access might not be necessary, but it is requested
+//		perhaps because it is required by BackupRead routine)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
+
 
 bool GCFOS_Client::GenerateBlockHashChain(GCFOS_REQUEST_CONTRIBUTE_FILE *pReqContributeFile, FILEHANDLE hFile, BYTE const * SHA1, UINT32 size, LPCTSTR filename)
 	{
@@ -1684,6 +2058,31 @@ GenerateBlockHashChain_cleanup:
 	free(pReqContributeFile);
 	return rtn;
 	}
+
+// ContributeFile
+// (Overloaded -- this version is for contributing by HANDLE)
+//
+// Parameters:
+//		hFile - handle of file to contribute
+//		SHA1 - hash of file
+//		size - file size
+//		filename - the source (local) where this file came from (diagnostic/tracking only)
+//		flags - optional flags (allows FORCE donation if admin)
+//
+// Description:
+//		If the caller calls Query() on a file and the response is GCFOS_SRV_RESP_WANTED, then the caller's obligation
+//		is to call ContributeFile on the given file. This could be done in another thread (with it's own instance of
+//		GCFOS_Client() so that the primary thread can continue its operations).
+//		Once this routine completes successfully, future Query() operations will then indicate GCFOS_SRV_RESP_RESIDENT so that
+//		the file data can be omitted from future backups.
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated
+//		Caller must have read/write access to file (write access might not be necessary, but it is requested
+//		perhaps because it is required by BackupRead routine)
+//
+// Returns:
+//		(bool) indicates success or failure of routine
 
 bool GCFOS_Client::ContributeFileByHandle(FILEHANDLE hFile, BYTE const * SHA1, UINT32 size, LPCTSTR filename, UCHAR flags /* = 0*/) 
 	{
@@ -1935,7 +2334,26 @@ ContributeFile_cleanup:
 	return rtn;
 	}
 
- GCFOS_SRV_RESPONSE GCFOS_Client::DeleteObject(BYTE const * SHA1, UINT32 size, UCHAR flags)
+// DeleteObject
+//
+// Parameters:
+//		SHA1 - hash of file
+//		size - file size
+//		flags - optional flags (GCFOS_REQUEST_DELETE_FILE_BUT_WANTED allows the server to delete the object, but re-mark the file as wanted)
+//
+// Description:
+//		Removes a common-file from the server's file-store.
+//		This is NOT recommended as other clients likely have cached entries indicating that this file is resident.
+//		If a server ever has any objects arbitrarily deleted, it would be necessary to set the server's "ServerValidation" to a new
+//		random value so that all clients are forced to re-create their caches.
+// 
+// Prerequisites / assumptions:
+//		Caller must be connected and authenticated as an admin
+//
+// Returns:
+//		(bool) indicates success or failure of routine
+	
+GCFOS_SRV_RESPONSE GCFOS_Client::DeleteObject(BYTE const * SHA1, UINT32 size, UCHAR flags)
 	{
 	GCFOS_REQUEST_CONTRIBUTE_FILE	req;
 	GCFOS_LOCAL_ENTRY				residentEntry;
@@ -2004,6 +2422,21 @@ ContributeFile_cleanup:
 	return result;
 	}
 
+// GetSessionInfo
+//
+// Parameters:
+//		*info[out] - Structure containing session statistics
+//
+// Description:
+//		Gets statistical information about the current session, and passes it back to caller
+// 
+// Prerequisites / assumptions:
+//		NONE
+//
+// Returns:
+//		void
+
+
 void GCFOS_Client::GetSessionInfo(PGCFOS_CLIENT_SESSIONINFO info)
 	{
 	if(info == NULL)
@@ -2033,6 +2466,24 @@ void GCFOS_Client::GetSessionInfo(PGCFOS_CLIENT_SESSIONINFO info)
 	info->TotalBlockQueryTime = (double)(m_priv->m_BlkQueryTime) / (double)m_statics->liCounterFreq.QuadPart;
 	info->TotalBlockStoreTime = (double)(m_priv->m_BlkStoreTime) / (double)m_statics->liCounterFreq.QuadPart;
 	}
+
+// GetSessionInfo
+//
+// Parameters:
+//		path - fully-qualified path to file
+//		SHA1 - hash of file
+//		size - file size
+//
+// Description:
+//		Was used by debugging -- allowed caller to specify the origin of where each file came from.
+//		This was useful when wanting to test retrieval/compare operations to ensure that the
+//		file being retrieved was the same as the source file.
+// 
+// Prerequisites / assumptions:
+//		NONE
+//
+// Returns:
+//		(GCFOS_SRV_RESPONSE)
 
 GCFOS_SRV_RESPONSE GCFOS_Client::ProvideFileName(LPCTSTR path, BYTE const * SHA1, UINT32 size)
 	{
@@ -2079,6 +2530,20 @@ GCFOS_SRV_RESPONSE GCFOS_Client::ProvideFileName(LPCTSTR path, BYTE const * SHA1
 
 	return result;
 	}
+
+// LoadLCUDList
+//
+// Parameters:
+//		NONE
+//
+// Description:
+//		Examines registry / local LCUD database to ensure they are in sync with the latest version available on server
+// 
+// Prerequisites / assumptions:
+//		Local database/cache has been successfully initialized
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
 
 bool GCFOS_Client::LoadLCUDList()
 	{
@@ -2252,6 +2717,26 @@ bool GCFOS_Client::LoadLCUDList()
 	return true;
 	}
 
+// GenerateHashForFile
+//
+// Parameters:
+//		filename - fully-qualified path to file
+//		SHA1[out] - calculated hash of file
+//		expectedsize - file size
+//		ValidationKey - 4-byte validation key - Unique to the current client# of the session (needed for later retrieval)
+//
+// Description:
+//		See GenerateHashForHandle()
+// 
+// Prerequisites / assumptions:
+//		expectedsize MUST match the actual size of file (number of bytes expected to be read)
+//		Client has connected and authenticated
+//		Server has a configured file-store
+//		File can be opened for READ access
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
+
 bool GCFOS_Client::GenerateHashForFile(LPCTSTR filename, LPBYTE SHA1, UINT32 expectedsize, LPBYTE ValidationKey)
 	{
 	FILEHANDLE			hFile;
@@ -2272,6 +2757,32 @@ bool GCFOS_Client::GenerateHashForFile(LPCTSTR filename, LPBYTE SHA1, UINT32 exp
 	CloseHandle(hFile);
 	return rtnval;
 	}
+
+// GenerateHashForHandle
+//
+// Parameters:
+//		hFile - Open handle of file
+//		SHA1[out] - calculated hash of file
+//		expectedsize - file size
+//		ValidationKey[out] - 4-byte validation key - Unique to the current client# of the session (needed for later retrieval)
+//
+// Description:
+//		This routine physically reads all of the data sequentially in a file to calculate the SHA1
+//		hash, which is returned to the caller.
+//		Unfortunately, there is no easy way to concurrently generate a hash of the file by processing
+//		multiple buffers because each byte in sequence is used to determine the hash, so sequential
+//		processing of the whole file is necessary. The library contains a caching mechanism to store
+//		this calculated hash so that it is only necessary to re-compute the hash if the file has 
+//		changed or the cache is deleted.
+// 
+// Prerequisites / assumptions:
+//		expectedsize MUST match the actual size of file (number of bytes expected to be read)
+//		Client has connected and authenticated
+//		Server has a configured file-store
+//		File is opened for READ access
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
 
 bool GCFOS_Client::GenerateHashForHandle(FILEHANDLE hFile, LPBYTE SHA1, UINT32 expectedsize, LPBYTE ValidationKey)
 	{
@@ -2315,6 +2826,13 @@ bool GCFOS_Client::GenerateHashForHandle(FILEHANDLE hFile, LPBYTE SHA1, UINT32 e
 		return false;
 		}
 
+	// Now calcuate the "Validation Key". This is simply an offset calculated from the client ID#
+	// into the first 1MB of the file. The 4 bytes located at that offset then become the validation
+	// key. Each client ID will therefore likely get a different offset into the file and therefore
+	// a different key value. It is not possible to retrieve the file without the correct key for
+	// any given file, therefore the calling application must store the value of this key in
+	// addition to the hash and filesize in order to retrieve the file in the future.
+	// See DetermineOffsetForValidationKey() for how the offset is calculated.
 	dwPos = DetermineOffsetForValidationKey(m_priv->m_ClientID, SHA1, expectedsize);
 #ifdef _WIN32
 	SetFilePointer(hFile, dwPos, NULL, FILE_BEGIN);
@@ -2332,6 +2850,26 @@ bool GCFOS_Client::GenerateHashForHandle(FILEHANDLE hFile, LPBYTE SHA1, UINT32 e
 
 	return true;
 	}
+
+// GetHash
+//
+// Parameters:
+//		filename - fully-qualified path to file
+//		SHA1[out] - calculated hash of file
+//		(FILETIME*) pFt - FILETIME value of the last-modified time of the file (or NULL if the routine should determine itself)
+//		(UINT32 *)pSize - filesize of file, or NULL if routine should determine itself
+//		ValidationKey[out] - 4-byte validation key - Unique to the current client# of the session (needed for later retrieval)
+//
+// Description:
+//		Set GetHashForHandle()
+// 
+// Prerequisites / assumptions:
+//		Client has connected and authenticated
+//		Server has a configured file-store
+//		File can be opened for READ access
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
 
 bool GCFOS_Client::GetHash(LPCTSTR filename, LPCTSTR filepathForOpen, LPBYTE SHA1, LPFILETIME pFt, PUINT32 pSize, LPBYTE ValidationKey)
 	{
@@ -2371,6 +2909,24 @@ bool GCFOS_Client::GetHash(LPCTSTR filename, LPCTSTR filepathForOpen, LPBYTE SHA
 	return rtnval;
 	}
 
+// GetHashForFilename
+//
+// Parameters:
+//		filename - fully-qualified path to file
+//		filenamehash[out] - calculated hash of filename (MD5, hence 16 bytes)
+//
+// Description:
+//		This routine converts the fully-qualified fileNAME into an MD5 hash.
+//		This hash is then used to lookup a database to obtain the SHA1 hash of the file CONTENTS
+//		Ordinarily the calculation of the SHA1 hash from file-contents is a very expensive
+//		operation (many milliseconds), but looking up the SHA1 hash from the cache is very
+//		efficient (a few microseconds).
+// 
+// Prerequisites / assumptions:
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
+
 bool GCFOS_Client::GetHashForFilename(LPCTSTR filename, BYTE *filenamehash)
 	{
 	ssize_t				filenamelen;
@@ -2387,14 +2943,26 @@ bool GCFOS_Client::GetHashForFilename(LPCTSTR filename, BYTE *filenamehash)
 	ippsHashInit(ctx1, IPP_ALG_HASH_MD5);
 
 #if 0
-												Normalized (for MD5 generation)		value of firstpart(used to ensure same case)
+With Windows, there are 4 distinct types of filenaming conventions that may be used.
+We have to normalize these filenames so that they will match when we generate the MD5 hash of
+the filepath (ie \\?\C:\dir\file is the same as C:\dir\file). The caller should ensure that
+the case of the filepath given is always consistent, because this routine avoids the cost
+of setting the case of the input path. If this is not done, then the cache will contain
+multiple entries for each type of file given, i.e. file, File, FILE are three distinct
+values and will therefore take three entries in the cache database.
+
+NOTE: Relative path naming is NOT supported, all paths must be fully qualified.
+
+"case" here is to locate distinct parts of code below used when parsing that particular
+naming convention.
+												Normalized (for MD5 generation)		value of firstpart
 case 1:		c:\dir\file.txt						c:\dir\file.txt						C:\
 case 2:		\\?\C:\dir\file.txt					c:\dir\file.txt						C:\
 case 3:		\\server\share\file.txt				\\server\share\file.txt				SERVER\SHARE\
 case 4:		\\?\UNC\server\share\file.txt		\\server\share\file.txt				SERVER\SHARE\
 
-
 #endif//0
+
 #ifdef _WIN32
 	TCHAR				firstpart[64];
 
@@ -2496,6 +3064,7 @@ case 4:		\\?\UNC\server\share\file.txt		\\server\share\file.txt				SERVER\SHARE\
 		}
 	ippsHashUpdate((Ipp8u*)&firstpart, (int)(i * sizeof(TCHAR)), ctx1);
 #else
+	// On Linux, ensure that a the path is NOT relative
 	j = 0;
 	if(filenamelen == 0 || filename[0] != '/')
 		{
@@ -2509,6 +3078,27 @@ case 4:		\\?\UNC\server\share\file.txt		\\server\share\file.txt				SERVER\SHARE\
 	return true;
 	}
 
+// GetHash
+//
+// Parameters:
+//		filename - fully-qualified path to file
+//		hFile - the open file handle
+//		SHA1[out] - calculated hash of file
+//		(FILETIME) Ft - FILETIME value of the last-modified time of the file
+//		(UINT32)Size - filesize of file
+//		ValidationKey[out] - 4-byte validation key - Unique to the current client# of the session (needed for later retrieval)
+//
+// Description:
+//		
+// 
+// Prerequisites / assumptions:
+//		Client has connected and authenticated
+//		Server has a configured file-store
+//		File can be opened for READ access
+//
+// Returns:
+//		(bool) Indicates success / failure of routine
+
 bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE SHA1, FILETIME Ft, UINT32 Size, LPBYTE ValidationKey)
 	{
 	Ipp8u				filenamehash[GCFOS_FILENAME_HASH_LEN];
@@ -2518,7 +3108,6 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 	MDB_txn				*txn;
 	GCFOS_UsefulTime	timenow;
 	UINT32				extra_len;
-	UINT32				SizeOfHashes;
 	LPBYTE				value_ref;
 
 	if(filename == NULL)
@@ -2528,18 +3117,18 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 		}
 
 	if(!FileStoreEnabled())
-		return false;
+		return false; // no file-store configured on the server we are connected to
 
 	if(Size < GCFOS_FILE_MINIMUM_SIZE)
-		return false;
+		return false; // file is not big enough to store in file-store
 
+	// check to see if there is a cache configured:
 	if(_tcsnicmp(filename, m_CachePath, _tcslen(m_CachePath)) == 0)
 		return false;
 
+	// Now convert the fileNAME into an MD5 hash
 	if(!GetHashForFilename(filename, filenamehash))
 		return false;
-
-	SizeOfHashes = GetHashDataLengthForFileSize(Size);
 
 	cacheentry = (PGCFOS_CLIENT_CACHE_ENTRY)malloc(sizeof(GCFOS_CLIENT_CACHE_ENTRY));
 	if(cacheentry == NULL)
@@ -2550,10 +3139,13 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 
 	if(m_bEnableLocalCache)
 		{
+		// we have a local hash configured, so check to see if the SHA1 hash for this
+		// file is already known
 		rc = gcfosdb::BeginTxn(&txn);
 		if(rc != 0)
 			{
 			DEBUGLOG(("GCOFS_Client::GetHashForHandle unable to begin txn, %d", rc));
+			// Unable to lookup hash from cache, so calculate it now:
 			return GenerateHashForHandle(hFile, SHA1, Size, ValidationKey);
 			}
 		memcpy(&cacheentry->filehash, &filenamehash, GCFOS_FILENAME_HASH_LEN);
@@ -2586,6 +3178,7 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 					gcfosdb::AbortTxn(txn);
 					free(cacheentry);
 					}
+				// we mustn't free cacheentry here because it's already been freed above
 				m_priv->m_SHA1Hits++;
 				return true;
 				}
@@ -2594,9 +3187,12 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 		gcfosdb::AbortTxn(txn);
 		}
 
-	m_priv->m_SHA1Misses++;
+	// we were unable to locate this filename in the SHA1 cache, so we have to calculate the SHA1
+	// hash from scratch now.
+	m_priv->m_SHA1Misses++; // count this cache-miss
 	if(!GenerateHashForHandle(hFile, SHA1, Size, ValidationKey))
 		{
+		// failed to calculate the hash, let caller know
 		free(cacheentry);
 		return false;
 		}
@@ -2606,6 +3202,9 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 		free(cacheentry);
 		return true;
 		}
+
+	// we have an active filename->SHA1 cache active and we need to udpate the hash for this
+	// filename
 
 	// don't want to hold txn open during GenerateHashForHandle() as this could be a long operation
 	rc = gcfosdb::BeginTxn(&txn);
@@ -2650,6 +3249,8 @@ bool GCFOS_Client::GetHashForHandle(LPCTSTR filename, FILEHANDLE hFile, LPBYTE S
 	return true;
 	}
 
+// define some private structures used by only this source file for work-thread use
+
 typedef struct {
 	GCFOS_PRIVATE_MEMBERS	*me;
 	UINT32			idx;
@@ -2662,6 +3263,20 @@ typedef struct {
 	EVENTHANDLE			hComplete;
 	} GCFOSCLIENT_WORK_ITEM, *PGCFOSCLIENT_WORK_ITEM;
 
+// BeginWorkThread
+//
+// Parameters:
+//		(void*) param -> casted to a PGCFOSCLIENT_WORK_THREAD_INFO (_beginthread requires a void*)
+//
+// Description:
+//		Set GetHashForHandle()
+// 
+// Prerequisites / assumptions:
+//		param has been allocated by caller, and the heComplete member is a valid Event object
+//
+// Returns:
+//		void
+
 void __cdecl BeginWorkThread(void *param)
 	{
 	GCFOS_PRIVATE_MEMBERS	*me;
@@ -2672,8 +3287,25 @@ void __cdecl BeginWorkThread(void *param)
 	SetEvent(info->heComplete);
 	// info NO LONGER ACCESSIBLE at this point!
 	me->WorkThread();
-	_endthread();
+	_endthread(); // releases resources correctly
 	}
+
+// WorkThread
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Uses an IOCP to wait for a work item to arrive.
+//		At arrival, this represents a buffer of GCFOS_BLOCK_SIZE to calculate the SHA2-224 hash on
+//		a given buffer, signalling hComplete when done
+//		Buffer address, calculated hash and completion event are all available in the workitem
+// 
+// Prerequisites / assumptions:
+//		m_hWorkerPort is a correctly initialized completion port
+//
+// Returns:
+//		void
 
 void GCFOS_PRIVATE_MEMBERS::WorkThread()
 	{
@@ -2697,6 +3329,22 @@ void GCFOS_PRIVATE_MEMBERS::WorkThread()
 		SetEvent(WorkItem->hComplete);
 		}
 	}
+
+// InitializeWorkThreads
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Initializes compression and completion port
+//		Initializes a number of worker threads dependent on number of processor cores in system
+//		Will not return until all worker threads have successfully initialized
+// 
+// Prerequisites / assumptions:
+//		param has been allocated by caller, and the heComplete member is a valid Event object
+//
+// Returns:
+//		(bool) indicating success / failure of routine
 
 bool GCFOS_PRIVATE_MEMBERS::InitializeWorkThreads()
 	{
@@ -2755,6 +3403,32 @@ bool GCFOS_PRIVATE_MEMBERS::InitializeWorkThreads()
 	return true;
 	}
 
+// CalculateHashesForBlocks
+//
+// Parameters:
+//		pBlockData - buffer of data to encode to hashes (max 64KB)
+//		UINT32[out] blks - how many blocks processed
+//		size - size of buffer pointed to by pBlockData
+//		pReferences[out] - hashes
+//		outsize[out] - size of area pointed to by pReferences
+//		straggler_block - pointer to "staggler block" (if any)
+//
+// Description:
+//		Uses the work threads to concurrently convert all of the 4KB blocks
+//		that exist in the pBlockData buffer to hashes. The straggler_block is optional and
+//		is used in the event that the input buffer is not exactly divisible by GCFOS_BLOCK_SIZE
+//		If the last chunk of data is at least GCFOS_MINIMUM_BLOCK_SIZE (0x100) then the data
+//		is copied from pBlockData to the straggler block and then the hash is calculated
+//		from that buffer address. This is necessary because the straggler-block must be zero
+//		filled to a complete block size.
+// 
+// Prerequisites / assumptions:
+//		Client is connected to a server configured with a block store active.
+//		straggler_block (if not NULL) must be at least GCFOS_BLOCK_SIZE bytes
+//
+// Returns:
+//		void
+
 int GCFOS_Client::CalculateHashesForBlocks(BYTE const * pBlockData, UINT32 &blks, const UINT32 size, LPBYTE pReferences, PUINT32 outsize, LPBYTE straggler_block)
 	{
 	GCFOSCLIENT_WORK_ITEM	WorkItems[GCFOS_BLOCKS_PER_QUERY];
@@ -2810,6 +3484,36 @@ int GCFOS_Client::CalculateHashesForBlocks(BYTE const * pBlockData, UINT32 &blks
 	return straggler;
 	}
 
+// StoreBlocks
+//
+// Parameters:
+//		pBlockData - raw input data to store into block-store
+//		size - size of input data (max 64KB)
+//		pReferences[out] - array of hashes generated
+//		outsize[out] - size in bytes of data returned. Since each hash is 28 bytes and there are 16 blocks
+//				- the max size of outsize is 448 bytes (to represent 64KB)
+//
+// Description:
+//		This routine calculates all of the hashes for the data provided by pBlockData
+//		It then queries its local block cache (if so configured) to see where blocks the server already has
+//		It then transmits the *compressed* data to the server for storage, and then updates its
+//		own cache so that it knows not to contact the server again if this data is encountered again.
+//		The cache for the blocks maintains a "last referenced" value which is udpated (with a certain
+//		tolerace for this info to be out of date, in the interests of performance). This last_ref
+//		time is updated if the tolerance is exceeded. Currently, this tolerance is 0 -- i.e. disabled.
+//
+//		A succesful return code indicates that the data has been stored on the server, and therefore
+//		the caller only need store the hashes of the data in order to subsequently retrieve
+//		the full data in the future.
+//
+//		A future update could use the worker threads to implement concurrent block compression.
+// 
+// Prerequisites / assumptions:
+//		Client is connected to server with a configured block-store
+//
+// Returns:
+//		(bool) indicating success / failure of routine
+
 bool GCFOS_Client::StoreBlocks(BYTE const * pBlockData, UINT32 size, LPBYTE pReferences, PUINT32 outsize)
 	{
 	UINT32					i, found;
@@ -2857,6 +3561,8 @@ bool GCFOS_Client::StoreBlocks(BYTE const * pBlockData, UINT32 size, LPBYTE pRef
 
 	if(size % GCFOS_BLOCK_SIZE  && (size % GCFOS_BLOCK_SIZE) < GCFOS_MINIMUM_BLOCK_SIZE)
 		{
+		//This message might let developer aware that there is some data too small at end of the buffer
+		//that the caller has the responsibility to store itself.
 		DEBUGLOG(("GCFOS_Client::StoreBlocks (warning) received straggler block of insufficient size %u\n", size));
 		}
 
@@ -3105,15 +3811,65 @@ bool GCFOS_Client::StoreBlocks(BYTE const * pBlockData, UINT32 size, LPBYTE pRef
 	return true;
 	}
 
+// BlockStoreEnabled
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Check to see if the connected-to server has an active block-store configured.
+// 
+// Prerequisites / assumptions:
+//		None
+//
+// Returns:
+//		(bool) true = server has an active block store, false = does not
+
 bool GCFOS_Client::BlockStoreEnabled()
 	{
 	return (m_priv->m_ServerVersion.BlockStore ? true : false);
 	}
 
+// FileStoreEnabled
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Check to see if the connected-to server has an active file-store configured.
+// 
+// Prerequisites / assumptions:
+//		None
+//
+// Returns:
+//		(bool) true = server has an active file store, false = does not
+
 bool GCFOS_Client::FileStoreEnabled()
 	{
 	return (m_priv->m_ServerVersion.FileStore ? true : false);
 	}
+
+// RetrieveBlocks
+//
+// Parameters:
+//		Hashes - Array of block hashes to be retrieved
+//		Count[in][out] - Number of blocks to retrieve, returns actual number of blocks retrieved (max GCFOS_BLOCKS_PER_QUERY)
+//		Blocks - Pointer to buffer to store the retrieved blocks (max GCFOS_MAX_BLOCK_SIZE)
+//
+// Description:
+//		This routine is the counter part to StoreBlocks()
+//		Given a set of hashes (at most GCFOS_BLOCKS_PER_QUERY) this routine will request from
+//		the server the data represented by these hashes.
+//		No caching is possible with this routine, so every block retrieval requires making a
+//		request to the server (one request can process up to GCFOS_BLOCKS_PER_QUERY blocks at a time)
+//		The server transmits the data compressed and this routine decompresses the data
+//		prior to returning it to the caller.
+// 
+// Prerequisites / assumptions:
+//		Client is connected to server with a configured block-store
+//
+// Returns:
+//		(bool) Indicates success or failure of routine
 
 bool GCFOS_Client::RetrieveBlocks(BYTE const * Hashes, PUINT16 Count, LPBYTE Blocks)
 	{
@@ -3129,16 +3885,23 @@ bool GCFOS_Client::RetrieveBlocks(BYTE const * Hashes, PUINT16 Count, LPBYTE Blo
 	if(!BlockStoreEnabled())
 		return false;
 
+	// A "sentinel" -- GCFOS_BLOCK_HASH_LEN bytes of all zeroes may be passed into the routine
+	// to indicate the end of hashes, in which case the count is adjusted accordingly
+	// Search the input array of hashes now to see if the sentinel is present
 	memset(&Sentinel, 0, GCFOS_BLOCK_HASH_LEN);
 	for(*Count = 0; (*Count) < GCFOS_BLOCKS_PER_QUERY; (*Count)++)
 		{
 		if(memcmp(&Sentinel, &Hashes[(*Count) * GCFOS_BLOCK_HASH_LEN], GCFOS_BLOCK_HASH_LEN) == 0)
+			// found sentinel, leave *Count set to the number of hashes actually present
 			break;
 		}
 
 	memcpy(&Req.hashes, Hashes, (*Count) * GCFOS_BLOCK_HASH_LEN);
 	if((*Count) < GCFOS_BLOCKS_PER_QUERY)
+		{
+		// set the sentinel now in the request to server
 		memset(&Req.hashes[(*Count) * GCFOS_BLOCK_HASH_LEN], 0, GCFOS_BLOCK_HASH_LEN);
+		}
 
 	Req.type = GCFOS_REQ_RESTORE_BLOCK;
 
@@ -3166,6 +3929,10 @@ bool GCFOS_Client::RetrieveBlocks(BYTE const * Hashes, PUINT16 Count, LPBYTE Blo
 		return false;
 		}
 
+	// What the server has sent first is an array of compressed-sizes of all the blocks
+	// Then we'll request each block's compressed data in order, decompress that buffer, then put in the
+	// appropriate output buffer
+
 	for(i = 0; i < (*Count); i++)
 		{
 		dwLen = recvBlock(m_priv->m_srv, (char *)&RawData, RetrieveBlockResp.Sizes[i], 0);
@@ -3177,11 +3944,12 @@ bool GCFOS_Client::RetrieveBlocks(BYTE const * Hashes, PUINT16 Count, LPBYTE Blo
 			}
 		if(RetrieveBlockResp.Sizes[i] == GCFOS_BLOCK_SIZE)
 			{
-			// uncompressed
+			// We've received an uncompressed block
 			memcpy(Blocks, &RawData, GCFOS_BLOCK_SIZE);
 			}
 		else
 			{
+			// Now decompress the block we've been sent
 			uncompsize = GCFOS_BLOCK_SIZE;
 			iDecompressionStatus = ippsDecodeLZOSafe_8u(RawData, RetrieveBlockResp.Sizes[i], Blocks, &uncompsize);
 			if(iDecompressionStatus != ippStsNoErr || uncompsize != GCFOS_BLOCK_SIZE)
@@ -3191,11 +3959,44 @@ bool GCFOS_Client::RetrieveBlocks(BYTE const * Hashes, PUINT16 Count, LPBYTE Blo
 				return false;
 				}
 			}
+		// Adjust output buffer position
 		Blocks += GCFOS_BLOCK_SIZE;
 		}
 	LeaveCriticalSection(&m_priv->m_csAccess);
 	return true;
 	}
+
+// EraseLocalCache
+//
+// Parameters:
+//		pszCachePath - The path used to store the local database/cache
+//		CompanyName - This defines where in the registry the configuration information is stored
+//		type - The type cache to erase
+//
+// Description:
+//		The type parameter may be one of the following values:
+//		GCFOS_LOCAL_ERASE_TYPE_BLOCKS:
+//			Delete the 'blocks' table which caches all of the known blocks that this client
+//			has successfully queried or stored in the past
+//		GCFOS_LOCAL_ERASE_TYPE_RESIDENT:
+//			Delete the 'resident' table which caches all of the files that this client has
+//			successfully determined that the server has stored as a common file
+//		GCFOS_LOCAL_ERASE_TYPE_UNIQUE:
+//			Delete the 'lcud' table which stores all of the files that are thought of as
+//			"unique" to this client (they may not actually be unique, rather the only
+//			thing that can be said for sure is that the file was not considered common
+//			when the time period expired for consideration)
+//		GCFOS_LOCAL_ERASE_TYPE_HASH:
+//			Delete the 'hashes' table which stores a file's block hashchain for each
+//			MD5 hash of a fully-qualified filename. This is used to lookup for a given
+//			filename the block hashchain instead of reading the whole file and computing
+//			the hash on all of the constituent blocks.			
+// 
+// Prerequisites / assumptions:
+//		Client is connected to a server
+//
+// Returns:
+//		(bool) Indicates success or failure of routine
 
 bool GCFOS_Client::EraseLocalCache(LPCTSTR pszCachePath, LPCTSTR CompanyName, GCFOS_LOCAL_ERASE_TYPE type)
 	{
@@ -3269,6 +4070,23 @@ bool GCFOS_Client::EraseLocalCache(LPCTSTR pszCachePath, LPCTSTR CompanyName, GC
 	return true;
 	}
 
+// UpdateLocalBlockCache
+//
+// Parameters:
+//		None
+//
+// Description:
+//		Phase 1:
+//			Purge 'blocks' table of block hashes that have not been referenced in a while
+//		Phase 2:
+//			Purge 'hashes' table of filename->blockchain entries that have not been referenced in a while
+// 
+// Prerequisites / assumptions:
+//		Environment has already been successfully initialized
+//
+// Returns:
+//		(bool) Indicates success or failure of routine
+
 bool GCFOS_Client::UpdateLocalBlockCache()
 	{
 	GCFOS_LOCAL_BLOCK_ENTRY					BlockEntry;
@@ -3297,6 +4115,13 @@ bool GCFOS_Client::UpdateLocalBlockCache()
 		DEBUGLOG(("UpdateLocalBlockCache: failed to begin txn %d\n", rc));
 		return false;
 		}
+
+	// Phase 1 - go through entire 'blocks' table and remove block hashes that have not been referenced
+	// in more than 45 days. This keeps the cache from filling with too many non-referenced block hashes.
+	// Deletes are batched into 500 deletions per transaction. Using one txn per delete is slow, but putting
+	// too many in one txn increases the risk that the database may run out of empty space and forcing a
+	// rollback (and therefore a repeat of all the deletions contained in that txn). Batching 500
+	// is a good compromise for performance / avoid forced rollback.
 
 	InformActiveHashes.type = GCFOS_REQ_INFORM_ACTIVE_HASHES; // this does not change
 	InformActiveHashes.count = 0;
@@ -3392,10 +4217,18 @@ bool GCFOS_Client::UpdateLocalBlockCache()
 	DEBUGLOG(("GCFOS_Client::UpdateLocalBlockCache: %I64u read, %I64u sent, %I64u deleted\n", RecsRead, RecsSent, RecsDeleted));
 	LeaveCriticalSection(&m_priv->m_csAccess);
 
-	memset(&restart_hash, 0, sizeof(restart_hash));
+	memset(&restart_hash, 0, sizeof(restart_hash)); // ensure we start at the beginning of the table
 	RecsRead = 0;
 	// leave RecsModified left set previously (this will cause txn to be committed earlier)
 	RecsDeleted = 0;
+
+	// Phase 2 - Go through entire 'hashes' table and remove entries that have not be referenced in 15 days
+	// in order to reduce the size of the table storing transient files.
+	// Deletes are batched into 500 deletions per transaction. Using one txn per delete is slow, but putting
+	// too many in one txn increases the risk that the database may run out of empty space and forcing a
+	// rollback (and therefore a repeat of all the deletions contained in that txn). Batching 500
+	// is a good compromise for performance / avoid forced rollback.
+
 	for(retry = 0; retry < 5; retry++)
 		{
 		rc = m_statics->m_db_hashes.createCursor(&c_hashes, txn, 0);
@@ -3474,6 +4307,24 @@ bool GCFOS_Client::UpdateLocalBlockCache()
 	return true;
 	}
 
+// GetHashDataLengthForFileSize
+//
+// Parameters:
+//		filesize - file size of file in question
+//
+// Description:
+//		This routine calculates the memory needed (in bytes) to store the entire blockchain for a
+//		file of 'filesize' bytes.
+//		This is basically 28 (GCFOS_BLOCK_HASH_LEN) bytes for every 4KB (GCFOS_BLOCK_SIZE) of data
+//		However, if the last block is a straggler, i.e. less than 0x100 (GCFOS_MINIMUM_BLOCK_SIZE)
+//		then the size of that last block must be added to the blockchain.
+// 
+// Prerequisites / assumptions:
+//		Environment has already been successfully initialized
+//
+// Returns:
+//		(bool) Indicates success or failure of routine
+
 UINT32 GCFOS_Client::GetHashDataLengthForFileSize(INT64 filesize)
 	{
 	UINT32			SizeOfHashes;
@@ -3492,6 +4343,28 @@ UINT32 GCFOS_Client::GetHashDataLengthForFileSize(INT64 filesize)
 		}
 	return SizeOfHashes;
 	}
+
+// GetBlockHashesForFile
+//
+// Parameters:
+//		hFile - handle of file open for read access
+//		filename - fully-qualified filename for file being processed
+//		hashdata[out] - blockchain for the given file
+//		hashdata_size[in] - size of hashdata available, must call GetHashDataLengthForFileSize() prior to this routine
+//
+// Description:
+//		Obtains the blockchain (of hashes) for a given file
+//		This is either computed by reading the entire file, or if the optional "extended" cache is enabled
+//		this can be cached in the 'hashes' table of the local database.
+// 
+// Prerequisites / assumptions:
+//		Environment has already been successfully initialized
+//		File is open with sufficient access to read data
+//		File is NOT being modified or appended during this routine
+//		hashdata_size is the right size and equal to the value GetHashDataLengthForFileSize() for the file's size
+//
+// Returns:
+//		(INT64) Amount of data read from file (success) or negative (error)
 
 INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LPBYTE hashdata, UINT32 hashdata_size)
 	{
@@ -3521,11 +4394,18 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 	LPBYTE			value_ref;
 	WIN32_FILE_ATTRIBUTE_DATA attr;
 
+	// make sure file is open with a valid handle value
+
 	if(hFile == INVALID_HANDLE_VALUE || hFile == NULL)
 		{
 		return -15;
 		}
 
+	// make sure that there is an active block store on the server
+	if(!BlockStoreEnabled())
+		return -16;
+
+	// get size of the file
 #ifdef _WIN32
 	SYSTEMTIME		st;
 	BY_HANDLE_FILE_INFORMATION fileinfo;
@@ -3543,16 +4423,20 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 		}
 #endif
 
+	// convert filesize to a UINT64
 	SizeOfFile = ((UINT64)attr.nFileSizeHigh << 32ULL) + attr.nFileSizeLow;
 
+	// make sure that it's big enough for consideration (i.e. >= 0x100)
 	if(SizeOfFile < GCFOS_MINIMUM_BLOCK_SIZE)
 		{
 		return -12;
 		}
 
+	// Convert the fully-qualified filename to an MD5 hash
 	if(!GetHashForFilename(filename, filenamehash))
 		return -6;
 
+	// Calculate how many bytes will be needed to store all of the hashes (incl. straggler block)
 	SizeOfHashes = GetHashDataLengthForFileSize(SizeOfFile);
 	if(SizeOfHashes != hashdata_size)
 		return -13; // sanity check -- buffer passed in is not correct size
@@ -3571,9 +4455,17 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 
 	if(CompareFileTime(&attr.ftLastWriteTime, (LPFILETIME)&i64ft) > 0)
 		{
+		// indicate that file has been modified in the last 7 days
 		bFileRecentlyModified = true;
 		}
 
+	// m_bEnableExtendedLocalBlockCache is set when we cache the filename/MD5 hash to an entire blockchain
+	// If this is enabled, and the file has not been modified recently, then check to see if we have previously
+	// calculated the hash for this file (this also requires that the last-modified time is indentical to the
+	// cached value of this).
+	// The rationale here is that some files are frequently modified and there is never any point to incurring
+	// the expense of caching these files if they're just modified 3 days later and therefore invalidating
+	// the cache). Only when the file has not been modified in the last 7 days is it considered for caching.
 	if(m_bEnableExtendedLocalBlockCache && !bFileRecentlyModified)
 		{
 		rc = gcfosdb::BeginTxn(&txn, 0); // can't(?) be read-only as we are directly modifying the pages (for last_ref update)
@@ -3654,6 +4546,9 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 		memcpy(&cacheentry->filehash, &filenamehash, GCFOS_FILENAME_HASH_LEN);
 		}
 
+	// At this point we know that we do not have the blockchain hashed, so we must calculate
+	// it from scratch by reading entire file
+
 	buffer = (LPBYTE)VirtualAlloc(NULL, GCFOS_BLOCKS_PER_QUERY * GCFOS_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 	if(buffer == NULL)
 		{
@@ -3661,6 +4556,8 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 		free(cacheentry);
 		return -4;
 		}
+
+	// Initialize IPP for calculating SHA1 hash
 
 	ippsHashGetSize(&ctxSize);
 	ctx1=(IppsHashState*)( new Ipp8u [ctxSize]);
@@ -3675,6 +4572,7 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 #else
 	rewind(hFile);
 #endif//_WIN32
+	// file is now set to beginning of data area
 	while(bSuccess)
 		{
 		if(ReadFile(hFile, buffer, GCFOS_BLOCKS_PER_QUERY * GCFOS_BLOCK_SIZE, &dwRead, NULL))
@@ -3685,6 +4583,7 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 			if(dwRead % GCFOS_BLOCK_SIZE > 0
 			&& dwRead % GCFOS_BLOCK_SIZE < GCFOS_MINIMUM_BLOCK_SIZE)
 				{
+				// we have a non-regular block-size at end of buffer (i.e. not = 4KB)
 				stragglersize = (dwRead % GCFOS_BLOCK_SIZE);
 				if(dwRead < GCFOS_MINIMUM_BLOCK_SIZE)
 					{
@@ -3694,6 +4593,7 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 					}
 				else if(StoreBlocks(buffer, dwRead - stragglersize, pOuthash, &local_hashsize))
 					{
+					// data of all the blocks has now been stored in the block store
 					pOuthash += local_hashsize;
 					memcpy(pOuthash, buffer + dwRead - stragglersize, stragglersize);
 					break;
@@ -3707,6 +4607,9 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 				}
 			else
 				{
+				// store all of the buffer just read to the block-store
+				// this generates all of the hashes for this chunk of data
+				// these hashes are appended to blockchain (pOutHash is used to track)
 				if(!StoreBlocks(buffer, dwRead, pOuthash, &local_hashsize))
 					{
 					DEBUGLOG(("GCFOS_Client::GetBlockHashesForFile - StoreBlocks failed\n"));
@@ -3714,16 +4617,20 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 					break;
 					}
 				}
+			// adjust output offset of the hashes being calculated
 			pOuthash += local_hashsize;
 			}
 		else
 			{
+			// couldn't read from the input file
 			DEBUGLOG(("GCFOS_Client::GetBlockHashesForFile - ReadFile failed: %u\n", GetLastError()));
 			bSuccess = false;
 			break;
 			}
 		}
 
+	// reached the end of the file (or an error occurred)
+	// reset the file pointer back to the beginning of the file
 #ifdef _WIN32
 	SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
 #else
@@ -3813,6 +4720,7 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 			}
 		}
 
+	// cleanup now
 	VirtualFree(buffer, NULL, MEM_RELEASE);
 	free(cacheentry);
 	if(!bSuccess)
@@ -3822,6 +4730,24 @@ INT64 GCFOS_Client::GetBlockHashesForFile(FILEHANDLE hFile, LPCTSTR filename, LP
 
 	return SizeOfFile;
 	}
+
+// ValidateLocalBlockCache
+//
+// Parameters:
+//		None
+//
+// Description:
+//		This is not a normal routine necessary to call
+//		It validates that all blocks that the client believes are already present on the server
+//		matches what the server believes by manually querying the server for every block present
+//		in the local blocks cache table. This routine may take several seconds or minutes
+//		depending on the size of the local cache.
+// 
+// Prerequisites / assumptions:
+//		Environment has already been successfully initialized
+//
+// Returns:
+//		(bool) true = all blocks in local cache are present on server, false = there is a discrepancy
 
 bool GCFOS_Client::ValidateLocalBlockCache()
 	{
@@ -3915,6 +4841,7 @@ bool GCFOS_Client::ValidateLocalBlockCache()
 
 	if(rc != gcfosdb_NOTFOUND)
 		{
+		DEBUGLOG(("GCFOS_Client::ValidateLocalBlockCache: Unexpected error encountered when reading data: %d\n", rc));
 		}
 
 	DEBUGLOG(("GCFOS_Client::ValidateLocalBlockCache: %I64u read\n", RecsRead));
